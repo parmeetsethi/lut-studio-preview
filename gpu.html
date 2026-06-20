@@ -1370,7 +1370,7 @@ const CHANGELOG = [
       'MAJOR: the colour engine has been rebuilt — looks saved in older versions are not guaranteed to reproduce identically',
       'Exposure and white balance now compute in linear light, so highlights roll off more naturally and warm/cool shifts look physically correct instead of plasticky',
       'White balance is now a true chromatic adaptation (Bradford) that slides the white point along the Planckian locus, luminance-held so changing temperature no longer shifts overall brightness and neutral greys stay neutral',
-      'Contrast deliberately stays on screen values for the punchier, film-style look (linear contrast was crushing shadows)',
+      'Contrast and the tonal controls (highlights / shadows / whites / blacks) now adjust brightness in a perceptual colour space (Oklab lightness) — so they change how bright an area is without twisting its hue or muddying skin tones, and dark saturated colours keep their colour instead of crushing to grey',
       'Saturation and vibrance now work in a perceptual colour space (Oklab) — colour gets richer while hue and brightness stay put, so skin tones no longer slide orange when you push saturation',
       'Out-of-gamut colours now roll off by easing saturation in at constant hue instead of hard-clipping, keeping vivid colours and bright areas clean',
       'The colour-grading wheels (shadows / midtones / highlights) gain a brightness control, so you can lift or deepen each tonal range — true 3-way grading, not just tinting',
@@ -1815,26 +1815,33 @@ function applyAllInto(rIn, gIn, bIn, s, result) {
     // clamp negatives only (keep >1 highlight headroom for the tone/curve stages)
     r = linearToSrgb(r < 0 ? 0 : r); g = linearToSrgb(g < 0 ? 0 : g); b = linearToSrgb(b < 0 ? 0 : b);
   }
+  // Contrast + tone are HUE-PRESERVING (Engine 2.0): they adjust perceptual
+  // lightness (Oklab L) while holding hue & chroma (a,b), so a coloured area's
+  // channel balance — and therefore its hue — cannot twist. Neutral greys map by
+  // perceptual lightness. Replaces the old per-channel curves, which shifted hue
+  // up to ~9° on warm/skin tones and crushed dark saturated colours to black.
   const c = s.tone.contrast;
-  if (c !== 0) {
-    const m = 1 + c / 100;
-    r = (r - 0.5) * m + 0.5; g = (g - 0.5) * m + 0.5; b = (b - 0.5) * m + 0.5;
-  }
   const tone = s.tone;
-  if (tone.highlights !== 0 || tone.shadows !== 0 || tone.whites !== 0 || tone.blacks !== 0) {
-    const h = tone.highlights / 100, sh = tone.shadows / 100;
-    const w = tone.whites / 100, bk = tone.blacks / 100;
-    const trf = (x) => {
-      if (x <= 0) return Math.max(-0.05, bk * 0.05 + x);
-      if (x >= 1) return Math.min(1.05, w * 0.05 + x);
-      const wShadow = Math.max(0, (0.5 - x)) * 2;
-      const wHigh   = Math.max(0, (x - 0.5)) * 2;
-      const wBlack  = Math.max(0, 0.3 - x) / 0.3;
-      const wWhite  = Math.max(0, x - 0.7) / 0.3;
-      const env = x * (1 - x) * 4;
-      return x + h*wHigh*env*0.5 + sh*wShadow*env*0.5 + w*wWhite*(1-x)*0.6 + bk*wBlack*x*0.6;
-    };
-    r = trf(r); g = trf(g); b = trf(b);
+  const toneOn = tone.highlights !== 0 || tone.shadows !== 0 || tone.whites !== 0 || tone.blacks !== 0;
+  if (c !== 0 || toneOn) {
+    _rgbToOklab(srgbToLinear(r < 0 ? 0 : r), srgbToLinear(g < 0 ? 0 : g), srgbToLinear(b < 0 ? 0 : b), _oklab);
+    let L = _oklab[0];
+    if (c !== 0) { const m = 1 + c / 100; L = (L - 0.5) * m + 0.5; }
+    if (toneOn) {
+      const h = tone.highlights / 100, sh = tone.shadows / 100, w = tone.whites / 100, bk = tone.blacks / 100;
+      const x = L;
+      if (x <= 0) L = Math.max(-0.05, bk * 0.05 + x);
+      else if (x >= 1) L = Math.min(1.05, w * 0.05 + x);
+      else {
+        const wShadow = Math.max(0, (0.5 - x)) * 2, wHigh = Math.max(0, (x - 0.5)) * 2;
+        const wBlack = Math.max(0, 0.3 - x) / 0.3, wWhite = Math.max(0, x - 0.7) / 0.3;
+        const env = x * (1 - x) * 4;
+        L = x + h*wHigh*env*0.5 + sh*wShadow*env*0.5 + w*wWhite*(1-x)*0.6 + bk*wBlack*x*0.6;
+      }
+    }
+    _oklab[0] = L;
+    _oklabToRgb(_oklab[0], _oklab[1], _oklab[2], _orgb);
+    r = linearToSrgb(_orgb[0]); g = linearToSrgb(_orgb[1]); b = linearToSrgb(_orgb[2]);
   }
   const cu = s.curves;
   const isId = (p) => p.length === 2 && p[0].x === 0 && p[0].y === 0 && p[1].x === 1 && p[1].y === 1;
