@@ -1955,7 +1955,7 @@ function initGL(){
   if(__gl!==null) return __gl;
   try{
     __glc=document.createElement('canvas');
-    __glc.style.cssText='position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;display:none;z-index:5;';
+    __glc.style.cssText='position:absolute;pointer-events:none;display:none;z-index:5;';
     const par=previewCanvas.parentElement; if(getComputedStyle(par).position==='static')par.style.position='relative'; par.appendChild(__glc);
     const gl=__glc.getContext('webgl2',{antialias:false,preserveDrawingBuffer:true}); if(!gl){__gl=false;return false;}
     const pr=gl.createProgram(); gl.attachShader(pr,__sh(gl,gl.VERTEX_SHADER,__VS)); gl.attachShader(pr,__sh(gl,gl.FRAGMENT_SHADER,__FS)); gl.bindAttribLocation(pr,0,'p'); gl.linkProgram(pr); if(!gl.getProgramParameter(pr,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(pr));
@@ -2393,6 +2393,7 @@ function renderPreviewProxy() {
     if (!__srcUp) { __uploadSrc(); __srcUp = true; }
     const N = 17; const clut = buildLUTN(state, N);
     renderGL(clut, N);
+    { const pr = __glc.parentElement.getBoundingClientRect(), cr = previewCanvas.getBoundingClientRect(); __glc.style.left=(cr.left-pr.left)+'px'; __glc.style.top=(cr.top-pr.top)+'px'; __glc.style.width=cr.width+'px'; __glc.style.height=cr.height+'px'; }
     __glc.style.display = 'block';
     proxyShown = true;
     clearTimeout(settleTimer);
