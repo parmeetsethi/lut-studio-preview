@@ -1,0 +1,513 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>GPU Preview Demo</title>
+<style>
+  :root{color-scheme:dark} body{margin:0;background:#111;color:#eee;font:15px/1.4 -apple-system,system-ui,sans-serif;padding:16px}
+  h1{font-size:16px;font-weight:600;margin:0 0 12px}
+  #stage{position:relative;width:100%;max-width:680px;margin:0 auto}
+  #preview{width:100%;height:auto;display:block;border-radius:10px;background:#000}
+  .ctl{max-width:680px;margin:14px auto 0;display:grid;grid-template-columns:96px 1fr 48px;gap:8px 12px;align-items:center}
+  .ctl label{font-size:13px;color:#bbb} .ctl output{font-variant-numeric:tabular-nums;color:#9cf;text-align:right}
+  input[type=range]{width:100%} #note{max-width:680px;margin:10px auto 0;color:#f99;font-size:13px;min-height:1em}
+</style></head><body>
+<h1>LUT Studio — GPU preview module (standalone)</h1>
+<div id="stage"><canvas id="preview"></canvas></div>
+<div id="note"></div>
+<div class="ctl">
+  <label>Exposure</label><input id="s_exposure" type="range" min="-1" max="1" step="0.01" value="0"><output id="o_exposure">0</output>
+  <label>Contrast</label><input id="s_contrast" type="range" min="-100" max="100" step="1" value="0"><output id="o_contrast">0</output>
+  <label>Saturation</label><input id="s_saturation" type="range" min="-100" max="100" step="1" value="0"><output id="o_saturation">0</output>
+  <label>Temp</label><input id="s_temp" type="range" min="-100" max="100" step="1" value="0"><output id="o_temp">0</output>
+</div>
+<script>const LUT_SIZE=33;
+const HUE_RANGES=[{"key":"red","name":"Red","center":0,"color":"#ef4444"},{"key":"orange","name":"Orange","center":30,"color":"#f97316"},{"key":"yellow","name":"Yellow","center":60,"color":"#eab308"},{"key":"green","name":"Green","center":120,"color":"#22c55e"},{"key":"aqua","name":"Aqua","center":180,"color":"#14b8a6"},{"key":"blue","name":"Blue","center":240,"color":"#3b82f6"},{"key":"purple","name":"Purple","center":270,"color":"#a855f7"},{"key":"magenta","name":"Magenta","center":320,"color":"#ec4899"}];
+const GRADE_REGIONS=[{"key":"shadows","name":"Shadows"},{"key":"midtones","name":"Midtones"},{"key":"highlights","name":"Highlights"}];
+const _RGB2XYZ=[0.4123908,0.3575843,0.1804808,0.212639,0.7151687,0.0721923,0.0193308,0.1191948,0.9505322];
+const _XYZ2RGB=[3.2409699,-1.5373832,-0.4986108,-0.9692436,1.8759675,0.0415551,0.0556301,-0.203977,1.0569715];
+const _BRAD=[0.8951,0.2664,-0.1614,-0.7502,1.7135,0.0367,0.0389,-0.0685,1.0296];
+const _BRAD_INV=[0.9869929,-0.1470543,0.1599627,0.4323053,0.5183603,0.0492912,-0.0085287,0.0400428,0.9684867];
+const WB_MIRED_PER_UNIT=0.9;
+const WB_TINT_STRENGTH=0.15;
+const _tmpHSL=new Float32Array(3),_tmpRGB=new Float32Array(3);
+const _oklab=new Float32Array(3),_orgb=new Float32Array(3);
+let _wbKey=null,_wbMat=null;
+const clamp01 = function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; };
+const hue2rgb = function hue2rgb(p, q, t) {
+  if (t < 0) t += 1; if (t > 1) t -= 1;
+  if (t < 1/6) return p + (q - p) * 6 * t;
+  if (t < 1/2) return q;
+  if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+  return p;
+};
+const evalCurve = function evalCurve(points, x) {
+  if (points.length < 2) return x;
+  if (x <= points[0].x) return points[0].y;
+  if (x >= points[points.length-1].x) return points[points.length-1].y;
+  let i = 0;
+  while (i < points.length - 1 && points[i+1].x < x) i++;
+  const p0 = points[i], p1 = points[i+1];
+  const h = p1.x - p0.x;
+  if (h <= 0) return p0.y;
+  const t = (x - p0.x) / h;
+  let m0, m1;
+  const dy = (p1.y - p0.y) / h;
+  if (i === 0) m0 = dy;
+  else { const hp = p0.x - points[i-1].x; m0 = hp > 0 ? ((p0.y - points[i-1].y) / hp + dy) / 2 : dy; }
+  if (i === points.length - 2) m1 = dy;
+  else { const hn = points[i+2].x - p1.x; m1 = hn > 0 ? (dy + (points[i+2].y - p1.y) / hn) / 2 : dy; }
+  if (dy === 0) { m0 = m1 = 0; }
+  else {
+    const a = m0 / dy, b = m1 / dy;
+    const sq = a*a + b*b;
+    if (sq > 9) { const tau = 3 / Math.sqrt(sq); m0 = tau * a * dy; m1 = tau * b * dy; }
+  }
+  const t2 = t*t, t3 = t2*t;
+  const h00 = 2*t3 - 3*t2 + 1, h10 = t3 - 2*t2 + t, h01 = -2*t3 + 3*t2, h11 = t3 - t2;
+  return h00*p0.y + h10*h*m0 + h01*p1.y + h11*h*m1;
+};
+const _hslToRgbInto = function _hslToRgbInto(h, s, l, out) {
+  h = ((h % 360) + 360) % 360 / 360;
+  if (s === 0) { out[0] = l; out[1] = l; out[2] = l; return; }
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  out[0] = hue2rgb(p, q, h + 1/3);
+  out[1] = hue2rgb(p, q, h);
+  out[2] = hue2rgb(p, q, h - 1/3);
+};
+const _rgbToHslInto = function _rgbToHslInto(r, g, b, out) {
+  const max = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  const min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  const l = (max + min) * 0.5;
+  if (max === min) { out[0] = 0; out[1] = 0; out[2] = l; return; }
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0));
+  else if (max === g) h = ((b - r) / d + 2);
+  else h = ((r - g) / d + 4);
+  out[0] = h * 60; out[1] = s; out[2] = l;
+};
+const srgbToLinear = function srgbToLinear(c) { return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+const linearToSrgb = function linearToSrgb(l) { return l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(l, 1 / 2.4) - 0.055; };
+const _mul3 = function _mul3(A, B) { const C = new Array(9); for (let r = 0; r < 3; r++) for (let cc = 0; cc < 3; cc++) { let s = 0; for (let k = 0; k < 3; k++) s += A[r * 3 + k] * B[k * 3 + cc]; C[r * 3 + cc] = s; } return C; };
+const _bradLMS = function _bradLMS(xyz) { return [_BRAD[0]*xyz[0]+_BRAD[1]*xyz[1]+_BRAD[2]*xyz[2], _BRAD[3]*xyz[0]+_BRAD[4]*xyz[1]+_BRAD[5]*xyz[2], _BRAD[6]*xyz[0]+_BRAD[7]*xyz[1]+_BRAD[8]*xyz[2]]; };
+const _planckXY = function _planckXY(T) {
+  let x;
+  if (T < 4000) x = -0.2661239e9 / (T*T*T) - 0.2343589e6 / (T*T) + 0.8776956e3 / T + 0.179910;
+  else          x = -3.0258469e9 / (T*T*T) + 2.1070379e6 / (T*T) + 0.2226347e3 / T + 0.240390;
+  let y;
+  if (T < 2222)      y = -1.1063814*x*x*x - 1.34811020*x*x + 2.18555832*x - 0.20219683;
+  else if (T < 4000) y = -0.9549476*x*x*x - 1.37418593*x*x + 2.09137015*x - 0.16748867;
+  else               y =  3.0817580*x*x*x - 5.87338670*x*x + 3.75112997*x - 0.37001483;
+  return [x, y];
+};
+const wbMatrix = function wbMatrix(wb) {
+  const key = wb.temp + ',' + wb.tint;
+  if (key === _wbKey) return _wbMat;
+  _wbKey = key;
+  let cct = 1e6 / (1e6 / 6500 + wb.temp * WB_MIRED_PER_UNIT);
+  if (cct < 2800) cct = 2800; else if (cct > 14000) cct = 14000;
+  const p0 = _planckXY(6500), pt = _planckXY(cct);            // shift D65 along the locus
+  const dx = 0.31270 + (pt[0] - p0[0]), dy = 0.32900 + (pt[1] - p0[1]);
+  const src = [0.31270 / 0.32900, 1, (1 - 0.31270 - 0.32900) / 0.32900]; // D65
+  const dst = [dx / dy, 1, (1 - dx - dy) / dy];
+  const sL = _bradLMS(src), dL = _bradLMS(dst);
+  const D = [dL[0]/sL[0], 0, 0, 0, dL[1]/sL[1], 0, 0, 0, dL[2]/sL[2]];
+  const M = _mul3(_XYZ2RGB, _mul3(_mul3(_BRAD_INV, D), _BRAD)); // = XYZ2RGB · (BRAD⁻¹ D BRAD) · RGB2XYZ
+  const M2 = _mul3(M, _RGB2XYZ);
+  const tau = wb.tint / 100 * WB_TINT_STRENGTH;                // green↔magenta, luminance-held
+  let gR = 1 + tau * 0.5, gG = 1 - tau, gB = 1 + tau * 0.5;
+  const Ln = 0.2126 * gR + 0.7152 * gG + 0.0722 * gB;
+  gR /= Ln; gG /= Ln; gB /= Ln;
+  _wbMat = [gR*M2[0], gR*M2[1], gR*M2[2], gG*M2[3], gG*M2[4], gG*M2[5], gB*M2[6], gB*M2[7], gB*M2[8]];
+  return _wbMat;
+};
+const _rgbToOklab = function _rgbToOklab(r, g, b, out) {
+  const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+  const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+  const s = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b);
+  out[0] = 0.2104542553*l + 0.7936177850*m - 0.0040720468*s;
+  out[1] = 1.9779984951*l - 2.4285922050*m + 0.4505937099*s;
+  out[2] = 0.0259040371*l + 0.7827717662*m - 0.8086757660*s;
+};
+const _oklabToRgb = function _oklabToRgb(L, A, B, out) {
+  const l_ = L + 0.3963377774*A + 0.2158037573*B;
+  const m_ = L - 0.1055613458*A - 0.0638541728*B;
+  const s_ = L - 0.0894841775*A - 1.2914855480*B;
+  const l = l_*l_*l_, m = m_*m_*m_, s = s_*s_*s_;
+  out[0] =  4.0767416621*l - 3.3077115913*m + 0.2309699292*s;
+  out[1] = -1.2684380046*l + 2.6097574011*m - 0.3413193965*s;
+  out[2] = -0.0041960863*l - 0.7034186147*m + 1.7076147010*s;
+};
+const softGamutInto = function softGamutInto(r, g, b, out) {
+  if (r >= 0 && r <= 1 && g >= 0 && g <= 1 && b >= 0 && b <= 1) { out[0] = r; out[1] = g; out[2] = b; return; }
+  _rgbToOklab(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b), _oklab);
+  let Lk = _oklab[0]; const A = _oklab[1], B = _oklab[2];
+  if (Lk < 0) Lk = 0; else if (Lk > 1) Lk = 1;
+  let lo = 0, hi = 1; // largest chroma scale that lands in gamut
+  for (let it = 0; it < 12; it++) {
+    const t = (lo + hi) * 0.5;
+    _oklabToRgb(Lk, A * t, B * t, _orgb);
+    if (_orgb[0] >= -1e-4 && _orgb[0] <= 1.0001 && _orgb[1] >= -1e-4 && _orgb[1] <= 1.0001 && _orgb[2] >= -1e-4 && _orgb[2] <= 1.0001) lo = t; else hi = t;
+  }
+  _oklabToRgb(Lk, A * lo, B * lo, _orgb);
+  const or_ = linearToSrgb(_orgb[0] < 0 ? 0 : _orgb[0]), og_ = linearToSrgb(_orgb[1] < 0 ? 0 : _orgb[1]), ob_ = linearToSrgb(_orgb[2] < 0 ? 0 : _orgb[2]);
+  out[0] = or_ < 0 ? 0 : or_ > 1 ? 1 : or_;
+  out[1] = og_ < 0 ? 0 : og_ > 1 ? 1 : og_;
+  out[2] = ob_ < 0 ? 0 : ob_ > 1 ? 1 : ob_;
+};
+const applyAllInto = function applyAllInto(rIn, gIn, bIn, s, result) {
+  let r = rIn, g = gIn, b = bIn;
+  const wb = s.wb, exposure = s.tone.exposure;
+  const wbActive = wb.temp !== 0 || wb.tint !== 0;
+  if (wbActive || exposure !== 0) {
+    // exposure + white balance in LINEAR light (re-encode to sRGB afterwards)
+    r = srgbToLinear(r); g = srgbToLinear(g); b = srgbToLinear(b);
+    if (wbActive) {
+      const M = wbMatrix(wb);
+      const nr = M[0]*r + M[1]*g + M[2]*b, ng = M[3]*r + M[4]*g + M[5]*b, nb = M[6]*r + M[7]*g + M[8]*b;
+      r = nr; g = ng; b = nb;
+    }
+    if (exposure !== 0) { const f = Math.pow(2, exposure); r *= f; g *= f; b *= f; }
+    // back to display-encoded sRGB for the rest of the (screen-space) pipeline;
+    // clamp negatives only (keep >1 highlight headroom for the tone/curve stages)
+    r = linearToSrgb(r < 0 ? 0 : r); g = linearToSrgb(g < 0 ? 0 : g); b = linearToSrgb(b < 0 ? 0 : b);
+  }
+  // Contrast + tone are HUE-PRESERVING (Engine 2.0): they adjust perceptual
+  // lightness (Oklab L) while holding hue & chroma (a,b), so a coloured area's
+  // channel balance — and therefore its hue — cannot twist. Neutral greys map by
+  // perceptual lightness. Replaces the old per-channel curves, which shifted hue
+  // up to ~9° on warm/skin tones and crushed dark saturated colours to black.
+  const c = s.tone.contrast;
+  const tone = s.tone;
+  const toneOn = tone.highlights !== 0 || tone.shadows !== 0 || tone.whites !== 0 || tone.blacks !== 0;
+  if (c !== 0 || toneOn) {
+    _rgbToOklab(srgbToLinear(r < 0 ? 0 : r), srgbToLinear(g < 0 ? 0 : g), srgbToLinear(b < 0 ? 0 : b), _oklab);
+    let L = _oklab[0];
+    if (c !== 0) { const m = 1 + c / 100; L = (L - 0.5) * m + 0.5; }
+    if (toneOn) {
+      const h = tone.highlights / 100, sh = tone.shadows / 100, w = tone.whites / 100, bk = tone.blacks / 100;
+      const x = L;
+      if (x <= 0) L = Math.max(-0.05, bk * 0.05 + x);
+      else if (x >= 1) L = Math.min(1.05, w * 0.05 + x);
+      else {
+        const wShadow = Math.max(0, (0.5 - x)) * 2, wHigh = Math.max(0, (x - 0.5)) * 2;
+        const wBlack = Math.max(0, 0.3 - x) / 0.3, wWhite = Math.max(0, x - 0.7) / 0.3;
+        const env = x * (1 - x) * 4;
+        L = x + h*wHigh*env*0.5 + sh*wShadow*env*0.5 + w*wWhite*(1-x)*0.6 + bk*wBlack*x*0.6;
+      }
+    }
+    _oklab[0] = L;
+    _oklabToRgb(_oklab[0], _oklab[1], _oklab[2], _orgb);
+    r = linearToSrgb(_orgb[0]); g = linearToSrgb(_orgb[1]); b = linearToSrgb(_orgb[2]);
+  }
+  const cu = s.curves;
+  const isId = (p) => p.length === 2 && p[0].x === 0 && p[0].y === 0 && p[1].x === 1 && p[1].y === 1;
+  if (!isId(cu.r)) r = evalCurve(cu.r, r < 0 ? 0 : r > 1 ? 1 : r);
+  if (!isId(cu.g)) g = evalCurve(cu.g, g < 0 ? 0 : g > 1 ? 1 : g);
+  if (!isId(cu.b)) b = evalCurve(cu.b, b < 0 ? 0 : b > 1 ? 1 : b);
+  if (!isId(cu.master)) {
+    // Master curve is a TONAL control → remap perceptual lightness (Oklab L) holding
+    // hue & chroma, so a contrast S-curve can't twist hue (the per-channel R/G/B
+    // curves above stay in RGB on purpose — they're a creative split-tone tool).
+    _rgbToOklab(srgbToLinear(r < 0 ? 0 : r), srgbToLinear(g < 0 ? 0 : g), srgbToLinear(b < 0 ? 0 : b), _oklab);
+    const Lm = _oklab[0];
+    _oklab[0] = evalCurve(cu.master, Lm < 0 ? 0 : Lm > 1 ? 1 : Lm);
+    _oklabToRgb(_oklab[0], _oklab[1], _oklab[2], _orgb);
+    r = linearToSrgb(_orgb[0]); g = linearToSrgb(_orgb[1]); b = linearToSrgb(_orgb[2]);
+  }
+  const hsl = s.hsl;
+  let hslDirty = false;
+  for (const k in hsl) { const p = hsl[k]; if (p.h !== 0 || p.s !== 0 || p.l !== 0) { hslDirty = true; break; } }
+  if (hslDirty) {
+    const rc = r < 0 ? 0 : r > 1 ? 1 : r, gc = g < 0 ? 0 : g > 1 ? 1 : g, bc = b < 0 ? 0 : b > 1 ? 1 : b;
+    _rgbToHslInto(rc, gc, bc, _tmpHSL);
+    const h0 = _tmpHSL[0], sat0 = _tmpHSL[1], l0 = _tmpHSL[2];
+    if (sat0 >= 0.005) {
+      let hShift = 0, sMul = 1, lShift = 0;
+      for (let i = 0; i < HUE_RANGES.length; i++) {
+        const range = HUE_RANGES[i];
+        const dh = Math.abs(h0 - range.center);
+        const d = dh > 180 ? 360 - dh : dh;
+        const weight = d >= 45 ? 0 : 1 - d / 45;
+        if (weight <= 0) continue;
+        const p = hsl[range.key];
+        hShift += (p.h / 100) * 30 * weight;
+        sMul *= 1 + (p.s / 100) * weight;
+        lShift += (p.l / 100) * 0.3 * weight;
+      }
+      let newS = sat0 * sMul; if (newS < 0) newS = 0; else if (newS > 1) newS = 1;
+      let newL = l0 + lShift; if (newL < 0) newL = 0; else if (newL > 1) newL = 1;
+      _hslToRgbInto(h0 + hShift, newS, newL, _tmpRGB);
+      r = _tmpRGB[0]; g = _tmpRGB[1]; b = _tmpRGB[2];
+    }
+  }
+  const grade = s.grade;
+  let gradeDirty = false;
+  for (const k in grade) { if (grade[k].s !== 0 || grade[k].l) { gradeDirty = true; break; } }
+  if (gradeDirty) {
+    const rc = r < 0 ? 0 : r > 1 ? 1 : r, gc = g < 0 ? 0 : g > 1 ? 1 : g, bc = b < 0 ? 0 : b > 1 ? 1 : b;
+    const L = 0.2126 * rc + 0.7152 * gc + 0.0722 * bc;
+    const wShadow = Math.max(0, 1 - L * 2);
+    const wHigh   = Math.max(0, (L - 0.5) * 2);
+    const wMid    = 1 - wShadow - wHigh;
+    let dr = 0, dg = 0, db = 0;
+    const regs = [ grade.shadows, wShadow, grade.midtones, wMid, grade.highlights, wHigh ];
+    for (let i = 0; i < 6; i += 2) {
+      const p = regs[i], w = regs[i+1];
+      if (p.s === 0 && !p.l) continue; // p.l may be undefined on pre-BL-2 presets → falsy
+      if (p.s !== 0) {
+        _hslToRgbInto(p.h, 1, 0.5, _tmpRGB);
+        const strength = (p.s / 100) * w * 0.5;
+        dr += (_tmpRGB[0] - 0.5) * strength;
+        dg += (_tmpRGB[1] - 0.5) * strength;
+        db += (_tmpRGB[2] - 0.5) * strength;
+      }
+      if (p.l) { const lift = (p.l / 100) * w * 0.4; dr += lift; dg += lift; db += lift; } // BL-2 per-band brightness
+    }
+    r += dr; g += dg; b += db;
+  }
+  const sat = s.saturation, vib = s.vibrance;
+  if (sat !== 0 || vib !== 0) {
+    // perceptual saturation/vibrance: scale Oklab chroma at fixed lightness & hue
+    _rgbToOklab(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b), _oklab);
+    const Lk = _oklab[0]; let A = _oklab[1], B = _oklab[2];
+    const C = Math.sqrt(A * A + B * B);
+    if (C > 1e-6) {
+      let mul = 1 + sat / 100;
+      if (vib !== 0) mul *= 1 + (vib / 100) * (1 - (C > 0.33 ? 1 : C / 0.33)); // protect already-saturated
+      if (mul < 0) mul = 0;
+      // Skin-tone chroma guard: damp saturation GAIN (never desaturation) in the skin
+      // hue band (Oklab hue ~48°, raised-cosine falloff ±24°) so a global saturation or
+      // vibrance push can't make faces lurid. Up to 45% less gain at the skin centre.
+      if (mul > 1) {
+        const dHue = Math.abs(Math.atan2(B, A) * 180 / Math.PI - 48);
+        const skinW = dHue < 24 ? 0.5 * (1 + Math.cos(Math.PI * dHue / 24)) : 0;
+        mul = 1 + (mul - 1) * (1 - 0.45 * skinW);
+      }
+      A *= mul; B *= mul;
+      _oklabToRgb(Lk, A, B, _orgb);
+      r = linearToSrgb(_orgb[0]); g = linearToSrgb(_orgb[1]); b = linearToSrgb(_orgb[2]);
+    }
+  }
+  // Filmic highlights (optional, default off): roll highlights off and bleach them
+  // toward white as real film/sensors do, so bright skin/highlights don't read plastic.
+  // Pure tonal: scales chroma uniformly (hue held) and compresses Oklab lightness.
+  const hroll = s.tone.highlightRolloff || 0;
+  if (hroll !== 0) {
+    const a = hroll / 100;
+    _rgbToOklab(srgbToLinear(r < 0 ? 0 : r), srgbToLinear(g < 0 ? 0 : g), srgbToLinear(b < 0 ? 0 : b), _oklab);
+    let L = _oklab[0];
+    let hw = L <= 0.7 ? 0 : (L >= 1 ? 1 : (L - 0.7) / 0.3);
+    hw = hw * hw * (3 - 2 * hw);                       // smoothstep highlight weight
+    const cmul = 1 - a * hw;                            // path-to-white: fade chroma near max L
+    _oklab[1] *= cmul; _oklab[2] *= cmul;
+    if (L > 0.7) { const t = L - 0.7; L = 0.7 + t / (1 + a * t * 1.5); } // soft shoulder
+    _oklab[0] = L;
+    _oklabToRgb(_oklab[0], _oklab[1], _oklab[2], _orgb);
+    r = linearToSrgb(_orgb[0]); g = linearToSrgb(_orgb[1]); b = linearToSrgb(_orgb[2]);
+  }
+  // hue-preserving gamut roll-off (replaces the old hard per-channel clamp)
+  softGamutInto(r, g, b, result);
+};
+const buildLUT = function buildLUT(s) {
+  const N = LUT_SIZE;
+  const arr = new Float32Array(N * N * N * 3);
+  const tmp = new Float32Array(3);
+  const NM1 = N - 1;
+  for (let bi = 0; bi < N; bi++) {
+    const b = bi / NM1;
+    for (let gi = 0; gi < N; gi++) {
+      const g = gi / NM1;
+      const rowBase = (bi * N * N + gi * N) * 3;
+      for (let ri = 0; ri < N; ri++) {
+        const r = ri / NM1;
+        applyAllInto(r, g, b, s, tmp);
+        const idx = rowBase + ri * 3;
+        arr[idx] = tmp[0]; arr[idx+1] = tmp[1]; arr[idx+2] = tmp[2];
+      }
+    }
+  }
+  return arr;
+};
+
+const defaultCurve = function defaultCurve() { return [{x:0,y:0},{x:1,y:1}]; };
+const defaultState = function defaultState() {
+  const state = {
+    name: 'Untitled',
+    tone: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, highlightRolloff: 0 },
+    wb:   { temp: 0, tint: 0 },
+    saturation: 0, vibrance: 0,
+    curves: { master: defaultCurve(), r: defaultCurve(), g: defaultCurve(), b: defaultCurve() },
+    hsl: {}, grade: {},
+  };
+  HUE_RANGES.forEach(r => { state.hsl[r.key] = { h: 0, s: 0, l: 0 }; });
+  GRADE_REGIONS.forEach(r => { state.grade[r.key] = { h: 0, s: 0, l: 0 }; });
+  return state;
+};</script>
+<script>// gpu-preview.js — standalone WebGL2 LUT preview for LUT Studio's live drag path.
+// ZERO colour maths: it only APPLIES a colour look-up table on the GPU. The table
+// is built by the host's own applyAllInto (dependency-injected), so the preview can
+// never drift from the exported .cube. Drop-in usage:
+//   const gpu = createGpuPreview({ applyAllInto });
+//   if (gpu.isSupported) {
+//     gpu.attach(previewCanvas);        // once
+//     gpu.setImage(photo);              // on image load (ImageData or canvas/img/bitmap)
+//     gpu.render(state);                // per drag frame  -> shows the overlay
+//     gpu.hide();                       // on release -> caller renders full CPU path
+//   } else { /* caller uses its existing CPU preview path */ }
+function createGpuPreview(opts) {
+  const applyAllInto = opts && opts.applyAllInto;
+  const N = (opts && opts.gridSize) || 17;
+  if (typeof applyAllInto !== 'function') throw new Error('createGpuPreview: applyAllInto is required');
+
+  const VS = `#version 300 es
+in vec2 p;out vec2 uv;void main(){uv=vec2(p.x*0.5+0.5,1.0-(p.y*0.5+0.5));gl_Position=vec4(p,0.0,1.0);}`;
+  const FS = `#version 300 es
+precision highp float;in vec2 uv;out vec4 o;uniform sampler2D src;uniform highp sampler2D lut;uniform float N;
+vec3 fetchN(int r,int g,int b){return texelFetch(lut,ivec2(b*int(N)+r,g),0).rgb;}
+vec3 look(vec3 c){float NM1=N-1.0;vec3 cf=clamp(c,0.0,1.0)*NM1;float r0=floor(cf.r),g0=floor(cf.g),b0=floor(cf.b);int R0=int(r0),G0=int(g0),B0=int(b0);int R1=int(min(r0+1.0,NM1)),G1=int(min(g0+1.0,NM1)),B1=int(min(b0+1.0,NM1));float dr=cf.r-r0,dg=cf.g-g0,db=cf.b-b0;
+vec3 c000=fetchN(R0,G0,B0),c100=fetchN(R1,G0,B0),c010=fetchN(R0,G1,B0),c110=fetchN(R1,G1,B0),c001=fetchN(R0,G0,B1),c101=fetchN(R1,G0,B1),c011=fetchN(R0,G1,B1),c111=fetchN(R1,G1,B1);
+vec3 c00=mix(c000,c100,dr),c10=mix(c010,c110,dr),c01=mix(c001,c101,dr),c11=mix(c011,c111,dr);return mix(mix(c00,c10,dg),mix(c01,c11,dg),db);}
+void main(){o=vec4(look(texture(src,uv).rgb),1.0);}`;
+
+  let gl = null, glc = null, prog = null, srcTex = null, lutTex = null, quad = null;
+  const uLoc = {};
+  let target = null, lutBuf = null;
+
+  function compile(type, s) { const x = gl.createShader(type); gl.shaderSource(x, s); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x; }
+
+  function init() {
+    glc = document.createElement('canvas');
+    glc.style.cssText = 'position:absolute;pointer-events:none;display:none;z-index:5;';
+    const g = glc.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
+    if (!g) return false;
+    gl = g;
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(prog, 0, 'p');
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    srcTex = gl.createTexture();
+    lutTex = gl.createTexture();
+    uLoc.src = gl.getUniformLocation(prog, 'src');
+    uLoc.lut = gl.getUniformLocation(prog, 'lut');
+    uLoc.N = gl.getUniformLocation(prog, 'N');
+    lutBuf = new Float32Array(N * N * N * 4); // tiled (N*N) x N x RGBA
+    return true;
+  }
+
+  let supported = false;
+  try { supported = init(); } catch (e) { if (typeof console !== 'undefined') console.warn('GPU preview init failed', e); supported = false; }
+
+  function uploadSrc(source) {
+    gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    let w, h;
+    if (source instanceof ImageData) {
+      w = source.width; h = source.height;
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, source.data);
+    } else {
+      w = source.width || source.videoWidth; h = source.height || source.videoHeight;
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    }
+    glc.width = w; glc.height = h; // backing store = image pixels (full-res render)
+  }
+
+  function uploadLut(lut) {
+    const W = N * N, H = N, buf = lutBuf;
+    for (let b = 0; b < N; b++) for (let g = 0; g < N; g++) for (let r = 0; r < N; r++) {
+      const idx = (b * N * N + g * N + r) * 3, tx = b * N + r, ty = g, p = (ty * W + tx) * 4;
+      buf[p] = lut[idx]; buf[p + 1] = lut[idx + 1]; buf[p + 2] = lut[idx + 2]; buf[p + 3] = 1;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, lutTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, buf);
+  }
+
+  function buildCoarse(state) {
+    const arr = new Float32Array(N * N * N * 3), tmp = new Float32Array(3), NM1 = N - 1;
+    for (let bi = 0; bi < N; bi++) { const b = bi / NM1; for (let gi = 0; gi < N; gi++) { const g = gi / NM1; const rb = (bi * N * N + gi * N) * 3; for (let ri = 0; ri < N; ri++) { const r = ri / NM1; applyAllInto(r, g, b, state, tmp); const idx = rb + ri * 3; arr[idx] = tmp[0]; arr[idx + 1] = tmp[1]; arr[idx + 2] = tmp[2]; } } }
+    return arr;
+  }
+
+  function align() {
+    if (!target) return;
+    const pr = glc.parentElement.getBoundingClientRect();
+    const cr = target.getBoundingClientRect();
+    glc.style.left = (cr.left - pr.left) + 'px';
+    glc.style.top = (cr.top - pr.top) + 'px';
+    glc.style.width = cr.width + 'px';   // CSS box = on-screen rect (NOT image px)
+    glc.style.height = cr.height + 'px';
+  }
+
+  return {
+    isSupported: supported,
+    gridSize: N,
+    canvas: glc,
+    attach(targetCanvas) {
+      if (!supported) return;
+      target = targetCanvas;
+      const par = target.parentElement;
+      if (getComputedStyle(par).position === 'static') par.style.position = 'relative';
+      par.appendChild(glc);
+    },
+    setImage(source) { if (supported) uploadSrc(source); },
+    render(state) {
+      if (!supported) return;
+      const lut = buildCoarse(state);
+      gl.viewport(0, 0, glc.width, glc.height);
+      gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex); gl.uniform1i(uLoc.src, 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lutTex); gl.uniform1i(uLoc.lut, 1);
+      gl.uniform1f(uLoc.N, N);
+      uploadLut(lut);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      align();
+      glc.style.display = 'block';
+    },
+    hide() { if (glc) glc.style.display = 'none'; },
+    detach() { if (glc) { glc.style.display = 'none'; if (glc.parentElement) glc.parentElement.removeChild(glc); } },
+  };
+}
+</script>
+<script>
+  const st = defaultState();
+  const canvas = document.getElementById('preview');
+  const ctx = canvas.getContext('2d');
+  const note = document.getElementById('note');
+  let gpu = null;
+  const img = new Image(); img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+    ctx.drawImage(img, 0, 0);
+    gpu = createGpuPreview({ applyAllInto });
+    if (!gpu.isSupported) { note.textContent = 'WebGL2 unavailable — GPU preview not supported on this browser.'; return; }
+    gpu.attach(canvas); gpu.setImage(img); gpu.render(st);
+  };
+  img.onerror = () => { note.textContent = 'Sample image failed to load (needs internet).'; };
+  img.src = "https://images.unsplash.com/photo-1675773051474-55c4b7d2cf53?w=1080&q=80&fm=jpg&auto=format&fit=crop";
+  function bind(id, apply) {
+    const el = document.getElementById('s_' + id), out = document.getElementById('o_' + id);
+    el.addEventListener('input', () => { out.textContent = el.value; apply(parseFloat(el.value)); if (gpu && gpu.isSupported) gpu.render(st); });
+  }
+  bind('exposure', v => st.tone.exposure = v);
+  bind('contrast', v => st.tone.contrast = v);
+  bind('saturation', v => st.saturation = v);
+  bind('temp', v => st.wb.temp = v);
+</script>
+</body></html>
